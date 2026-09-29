@@ -1,0 +1,10 @@
+data/
+backups/
+.env
+web/node_modules/
+web/dist/*
+!web/dist/.gitkeep
+.cache/
+e2e/node_modules/
+e2e/shots/
+e2e/*.png

@@ -1,0 +1,12 @@
+[Unit]
+Description=LightBacklog backup (database snapshot + uploads)
+Wants=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+# Set this to the directory that contains compose.yaml.
+WorkingDirectory=/srv/lightbacklog
+# Runs inside the app container; writes ./backups and prunes archives older than 14 days.
+ExecStart=/usr/bin/docker compose exec -T app /lightbacklog backup
+Nice=10
