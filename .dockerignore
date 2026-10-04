@@ -1,0 +1,5 @@
+.git
+.cache
+data
+backups
+web/node_modules

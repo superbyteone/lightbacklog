@@ -1,0 +1,656 @@
+openapi: 3.1.0
+info:
+  title: LightBacklog API
+  version: 0.1.0
+  description: |
+    REST API for LightBacklog. Everything the browser can do is available here; the MCP server
+    (`/mcp`) uses the same underlying service, so behaviour and validation are identical.
+
+    **Authentication.** Agents send `Authorization: Bearer lb_...` (create tokens in the UI or with
+    `lightbacklog token create`). Tokens are scoped `read` or `write` and may be restricted to
+    specific projects; they act as their owner and can never exceed the owner's own access.
+    The browser uses a session cookie and must send `X-LB-CSRF: 1` on mutations.
+
+    **Identifiers.** Projects and tasks have stable UUIDv7 `id`s. Projects also have an immutable
+    `key` (e.g. `WEB`) and tasks a display `ref` (`WEB-42`); either can be used in URLs. A task's
+    `ref` changes when it is moved to another project, its `id` never does.
+
+    **Avoiding duplicates.** Send `external_ref` (your own stable identifier) when creating tasks:
+    a second create with the same value in the same project returns the existing task (HTTP 200,
+    `X-Existing-Task: true`). `Idempotency-Key` on POST replays the first response for 24 hours.
+
+    **Avoiding lost updates.** Tasks carry an integer `version` (also the `ETag`). Send it as
+    `version` in the body or `If-Match: "<version>"`; a stale write fails with 409 `version_conflict`
+    and returns the current task in `current`.
+
+    **Errors** are `application/problem+json` with a stable `code`, a `detail` message and, for
+    validation failures, per-field `errors`.
+
+    **Pagination.** List endpoints return `{data, next_cursor, total?}`; pass `next_cursor` back as
+    `cursor` with the same `sort`. Default page size 50, maximum 200.
+servers:
+  - url: /
+security:
+  - bearer: []
+  - cookie: []
+tags:
+  - {name: Auth}
+  - {name: Projects}
+  - {name: Tasks}
+  - {name: Labels}
+  - {name: Attachments}
+  - {name: Tokens}
+  - {name: Users}
+paths:
+  /healthz:
+    get:
+      summary: Liveness and database check
+      security: []
+      responses:
+        "200": {description: OK}
+        "503": {$ref: "#/components/responses/Error"}
+  /api/v1/openapi.yaml:
+    get:
+      summary: This document
+      security: []
+      responses:
+        "200": {description: OpenAPI document (YAML)}
+  /api/v1/auth/login:
+    post:
+      tags: [Auth]
+      summary: Log in (browser session)
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: {type: string}
+                password: {type: string}
+      responses:
+        "200": {description: Logged in; sets the `lb_session` cookie}
+        "401": {$ref: "#/components/responses/Error"}
+        "429": {$ref: "#/components/responses/Error"}
+  /api/v1/auth/logout:
+    post:
+      tags: [Auth]
+      summary: Log out
+      responses:
+        "204": {description: Logged out}
+  /api/v1/me:
+    get:
+      tags: [Auth]
+      summary: The authenticated user and how they authenticated
+      responses:
+        "200": {description: OK}
+        "401": {$ref: "#/components/responses/Error"}
+  /api/v1/me/password:
+    post:
+      tags: [Auth]
+      summary: Change password (browser session only; revokes other sessions)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [current_password, new_password]
+              properties:
+                current_password: {type: string}
+                new_password: {type: string, minLength: 10}
+      responses:
+        "204": {description: Changed}
+        "422": {$ref: "#/components/responses/Error"}
+  /api/v1/me/preferences:
+    get:
+      tags: [Auth]
+      summary: Your saved interface preferences (browser session only)
+      description: A small JSON object of UI settings, such as the task list's column order, visibility and widths for each device class (`list.phone`, `list.tablet`, `list.desktop`).
+      responses:
+        "200": {description: "`{data: {<key>: <json>}}`"}
+    patch:
+      tags: [Auth]
+      summary: Merge interface preferences (browser session only)
+      description: Sets the given top-level keys and leaves the others alone; a `null` value deletes a key. Keys are lowercase letters, digits, `.`, `_`, `-`; at most 32 keys and 16 KiB in total.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {type: object, additionalProperties: true}
+      responses:
+        "200": {description: The full preferences after the merge}
+        "422": {$ref: "#/components/responses/Error"}
+  /api/v1/users:
+    get:
+      tags: [Users]
+      summary: List accounts (administrators only)
+      responses:
+        "200": {description: OK}
+        "403": {$ref: "#/components/responses/Error"}
+    post:
+      tags: [Users]
+      summary: Create an account (administrators only)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username: {type: string}
+                email: {type: string}
+                password: {type: string, minLength: 10}
+                is_admin: {type: boolean}
+      responses:
+        "201": {description: Created}
+        "409": {$ref: "#/components/responses/Error"}
+  /api/v1/users/{id}/disable:
+    post:
+      tags: [Users]
+      summary: Disable an account and end its sessions (administrators only)
+      parameters: [{$ref: "#/components/parameters/id"}]
+      responses:
+        "204": {description: Disabled}
+  /api/v1/users/{id}/enable:
+    post:
+      tags: [Users]
+      summary: Re-enable an account (administrators only)
+      parameters: [{$ref: "#/components/parameters/id"}]
+      responses:
+        "204": {description: Enabled}
+  /api/v1/tokens:
+    get:
+      tags: [Tokens]
+      summary: List your API tokens (secrets are never shown again)
+      responses:
+        "200": {description: OK}
+    post:
+      tags: [Tokens]
+      summary: Create an API token (browser session only)
+      description: The secret is returned once in `data.secret`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {type: string}
+                scope: {type: string, enum: [read, write], default: write}
+                projects:
+                  type: array
+                  items: {type: string}
+                  description: Restrict the token to these project keys or ids.
+                expires_in_days:
+                  type: integer
+                  description: Expire the token after this many days. Omitted or 0 means it never expires.
+      responses:
+        "201": {description: Created}
+  /api/v1/tokens/{id}:
+    delete:
+      tags: [Tokens]
+      summary: Revoke a token immediately
+      parameters: [{$ref: "#/components/parameters/id"}]
+      responses:
+        "204": {description: Revoked}
+  /api/v1/tokens/{id}/rotate:
+    post:
+      tags: [Tokens]
+      summary: Replace a token with a fresh secret, atomically
+      description: Keeps the same name, scope, project restriction and expiry policy. The old secret stops working and the new one (returned once in `data.secret`) starts working in the same transaction.
+      parameters: [{$ref: "#/components/parameters/id"}]
+      responses:
+        "201": {description: Created}
+  /api/v1/meta:
+    get:
+      summary: Valid statuses and priorities
+      responses:
+        "200": {description: "`{data: {statuses: [...], priorities: [...], types: [...]}}`"}
+  /api/v1/labels:
+    get:
+      tags: [Labels]
+      summary: List labels (shared by all projects)
+      responses:
+        "200": {description: OK}
+    post:
+      tags: [Labels]
+      summary: Create a label (returns the existing one if the name is taken, case-insensitively)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {type: string}
+                color: {type: string, pattern: "^#[0-9a-fA-F]{6}$"}
+      responses:
+        "201": {description: Created or existing}
+  /api/v1/labels/{id}:
+    patch:
+      tags: [Labels]
+      summary: Rename or recolor a label
+      parameters: [{$ref: "#/components/parameters/id"}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: {type: string}
+                color: {type: string}
+      responses:
+        "200": {description: Updated}
+        "409": {$ref: "#/components/responses/Error"}
+    delete:
+      tags: [Labels]
+      summary: Delete a label everywhere (administrators only)
+      parameters: [{$ref: "#/components/parameters/id"}]
+      responses:
+        "204": {description: Deleted}
+  /api/v1/projects:
+    get:
+      tags: [Projects]
+      summary: List (and search) projects you can access
+      parameters:
+        - {name: q, in: query, schema: {type: string}, description: Matches name, key and description}
+        - {name: archived, in: query, schema: {type: string, enum: [active, archived, all], default: active}}
+      responses:
+        "200": {description: "Projects with your `role` and `open_tasks` / `total_tasks` counts"}
+    post:
+      tags: [Projects]
+      summary: Create a project (you become its owner)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name]
+              properties:
+                name: {type: string, maxLength: 100}
+                key: {type: string, pattern: "^[A-Za-z][A-Za-z0-9]{1,7}$", description: Derived from the name when omitted}
+                description: {type: string}
+                color: {type: string, pattern: "^#[0-9a-fA-F]{6}$"}
+      responses:
+        "201": {description: Created}
+        "409": {$ref: "#/components/responses/Error"}
+  /api/v1/projects/{ref}:
+    get:
+      tags: [Projects]
+      summary: Get a project by id or key
+      parameters: [{$ref: "#/components/parameters/ref"}]
+      responses:
+        "200": {description: OK}
+        "404": {$ref: "#/components/responses/Error"}
+    patch:
+      tags: [Projects]
+      summary: Update name, description or color (owner only; the key is immutable)
+      parameters: [{$ref: "#/components/parameters/ref"}]
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                name: {type: string}
+                description: {type: string}
+                color: {type: string}
+      responses:
+        "200": {description: Updated}
+    delete:
+      tags: [Projects]
+      summary: Permanently delete an archived project (owner, browser session only)
+      description: |
+        Deletes the project with all its tasks, attachments and memberships. It cannot be undone. Not available to API tokens.
+        The project must be archived first, and `confirm` must repeat its key. API tokens that were restricted to only this
+        project are revoked (they would otherwise become unrestricted).
+      parameters:
+        - {$ref: "#/components/parameters/ref"}
+        - {name: confirm, in: query, required: true, schema: {type: string}, description: The project key}
+      responses:
+        "204": {description: Deleted}
+        "409": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+  /api/v1/projects/{ref}/archive:
+    post:
+      tags: [Projects]
+      summary: Archive a project (owner only). Its tasks become read-only and leave default lists.
+      parameters: [{$ref: "#/components/parameters/ref"}]
+      responses:
+        "200": {description: Archived}
+  /api/v1/projects/{ref}/unarchive:
+    post:
+      tags: [Projects]
+      summary: Restore an archived project (owner only)
+      parameters: [{$ref: "#/components/parameters/ref"}]
+      responses:
+        "200": {description: Restored}
+  /api/v1/projects/{ref}/favorite:
+    post:
+      tags: [Projects]
+      summary: Star a project for the caller (any member; a personal preference, not a project-wide setting)
+      parameters: [{$ref: "#/components/parameters/ref"}]
+      responses:
+        "200": {description: Favorited}
+  /api/v1/projects/{ref}/unfavorite:
+    post:
+      tags: [Projects]
+      summary: Unstar a project for the caller
+      parameters: [{$ref: "#/components/parameters/ref"}]
+      responses:
+        "200": {description: Unfavorited}
+  /api/v1/projects/{ref}/members:
+    get:
+      tags: [Projects]
+      summary: List project members
+      parameters: [{$ref: "#/components/parameters/ref"}]
+      responses:
+        "200": {description: OK}
+  /api/v1/projects/{ref}/members/{username}:
+    put:
+      tags: [Projects]
+      summary: Add a user or change their role (owner only)
+      parameters:
+        - {$ref: "#/components/parameters/ref"}
+        - {name: username, in: path, required: true, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [role]
+              properties:
+                role: {type: string, enum: [viewer, editor, owner]}
+      responses:
+        "200": {description: The updated member list}
+  /api/v1/projects/{ref}/members/{userID}:
+    delete:
+      tags: [Projects]
+      summary: Remove a member (owner only, or leave the project yourself)
+      parameters:
+        - {$ref: "#/components/parameters/ref"}
+        - {name: userID, in: path, required: true, schema: {type: string}}
+      responses:
+        "204": {description: Removed}
+        "409": {$ref: "#/components/responses/Error"}
+  /api/v1/projects/{ref}/tasks:
+    get:
+      tags: [Tasks]
+      summary: List tasks of one project (same filters as GET /tasks)
+      parameters:
+        - {$ref: "#/components/parameters/ref"}
+        - {$ref: "#/components/parameters/status"}
+        - {$ref: "#/components/parameters/priority"}
+        - {$ref: "#/components/parameters/label"}
+        - {$ref: "#/components/parameters/q"}
+        - {$ref: "#/components/parameters/sort"}
+        - {$ref: "#/components/parameters/cursor"}
+        - {$ref: "#/components/parameters/limit"}
+      responses:
+        "200": {description: A page of tasks}
+        "404": {$ref: "#/components/responses/Error"}
+  /api/v1/tasks:
+    get:
+      tags: [Tasks]
+      summary: List and search tasks across all accessible projects
+      description: Descriptions are omitted unless `include_description=true`. Tasks of archived projects are hidden unless `include_archived=true` or a `project` filter names the archived project.
+      parameters:
+        - {name: project, in: query, schema: {type: array, items: {type: string}}, style: form, explode: true, description: Project keys or ids; repeat or comma-separate}
+        - {$ref: "#/components/parameters/status"}
+        - {$ref: "#/components/parameters/priority"}
+        - {$ref: "#/components/parameters/type"}
+        - {$ref: "#/components/parameters/label"}
+        - {name: label_match, in: query, schema: {type: string, enum: [any, all], default: any}}
+        - {$ref: "#/components/parameters/q"}
+        - {name: due_before, in: query, schema: {type: string, format: date}}
+        - {name: due_after, in: query, schema: {type: string, format: date}}
+        - {name: has_due, in: query, schema: {type: boolean}}
+        - {name: include_archived, in: query, schema: {type: boolean}}
+        - {name: include_description, in: query, schema: {type: boolean}}
+        - {name: include_total, in: query, schema: {type: boolean}, description: Adds `total` (count ignoring pagination)}
+        - {$ref: "#/components/parameters/sort"}
+        - {$ref: "#/components/parameters/cursor"}
+        - {$ref: "#/components/parameters/limit"}
+      responses:
+        "200": {description: "`{data: [Task], next_cursor?, total?}`"}
+        "422": {$ref: "#/components/responses/Error"}
+    post:
+      tags: [Tasks]
+      summary: Create a task
+      parameters:
+        - {name: Idempotency-Key, in: header, schema: {type: string}, description: Replays the first response for 24 hours}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/CreateTask"}
+      responses:
+        "201": {description: Created}
+        "200": {description: A task with this `external_ref` already exists in the project; it is returned unchanged}
+        "422": {$ref: "#/components/responses/Error"}
+  /api/v1/tasks/{ref}:
+    get:
+      tags: [Tasks]
+      summary: Get a task by id or ref (e.g. WEB-42), including its description
+      parameters: [{$ref: "#/components/parameters/ref"}]
+      responses:
+        "200": {description: OK, headers: {ETag: {schema: {type: string}}}}
+        "404": {$ref: "#/components/responses/Error"}
+    patch:
+      tags: [Tasks]
+      summary: Partially update a task (fields you omit are unchanged; `null` clears due_date / external_ref)
+      parameters:
+        - {$ref: "#/components/parameters/ref"}
+        - {name: If-Match, in: header, schema: {type: string}, description: 'Task version, e.g. "3"'}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: {$ref: "#/components/schemas/UpdateTask"}
+      responses:
+        "200": {description: Updated}
+        "409": {$ref: "#/components/responses/Error"}
+        "422": {$ref: "#/components/responses/Error"}
+    delete:
+      tags: [Tasks]
+      summary: Permanently delete a task and its attachments
+      parameters:
+        - {$ref: "#/components/parameters/ref"}
+        - {name: If-Match, in: header, schema: {type: string}}
+      responses:
+        "204": {description: Deleted}
+        "409": {$ref: "#/components/responses/Error"}
+  /api/v1/tasks/{ref}/move:
+    post:
+      tags: [Tasks]
+      summary: Move a task to another project (keeps its id, gets a new ref)
+      parameters: [{$ref: "#/components/parameters/ref"}]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [project]
+              properties:
+                project: {type: string, description: Destination project key or id}
+                version: {type: integer}
+      responses:
+        "200": {description: Moved}
+  /api/v1/tasks/{ref}/attachments:
+    get:
+      tags: [Attachments]
+      summary: List a task's attachments
+      parameters: [{$ref: "#/components/parameters/ref"}]
+      responses:
+        "200": {description: "Attachments with `url` and a ready-to-paste `markdown` snippet"}
+    post:
+      tags: [Attachments]
+      summary: Upload a file or screenshot to a task
+      description: |
+        `multipart/form-data` with a `file` part, or a raw body with `?filename=`. Accepted by content
+        (never by the claimed type): png, jpeg, gif, webp (shown inline), pdf, zip, gzip, plain text
+        (download only). SVG/HTML/executables are rejected with 415; oversized files with 413.
+      parameters:
+        - {$ref: "#/components/parameters/ref"}
+        - {name: filename, in: query, schema: {type: string}, description: Required for raw-body uploads}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file: {type: string, format: binary}
+          application/octet-stream:
+            schema: {type: string, format: binary}
+      responses:
+        "201": {description: Uploaded}
+        "413": {$ref: "#/components/responses/Error"}
+        "415": {$ref: "#/components/responses/Error"}
+  /api/v1/uploads:
+    post:
+      tags: [Attachments]
+      summary: Upload a file to a project before its task exists
+      description: Send form fields (`project`) before the `file` part, or use `?project=`. Reference the returned `url` from a description; it is attached automatically when the task is saved.
+      parameters:
+        - {name: project, in: query, schema: {type: string}}
+        - {name: filename, in: query, schema: {type: string}}
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                project: {type: string}
+                file: {type: string, format: binary}
+      responses:
+        "201": {description: Uploaded}
+  /api/v1/attachments/{id}:
+    delete:
+      tags: [Attachments]
+      summary: Delete an attachment
+      parameters: [{$ref: "#/components/parameters/id"}]
+      responses:
+        "204": {description: Deleted}
+  /api/v1/events:
+    get:
+      tags: [Tasks]
+      summary: Live change notifications (Server-Sent Events)
+      description: |
+        A long-lived `text/event-stream`. Events (`task.created`, `task.updated`, `task.deleted`,
+        `project.changed`, `resync`) carry identifiers only (`project_id`, `task_id`, `ref`, `origin`);
+        re-fetch the resource through the normal endpoints. Only events for projects you can access are sent.
+      responses:
+        "200": {description: Event stream}
+  /files/{id}:
+    get:
+      tags: [Attachments]
+      summary: Download an attachment (requires project access)
+      parameters: [{$ref: "#/components/parameters/id"}]
+      responses:
+        "200": {description: The file; raster images inline, everything else as attachment}
+        "404": {$ref: "#/components/responses/Error"}
+components:
+  securitySchemes:
+    bearer: {type: http, scheme: bearer, description: "API token, `lb_...`"}
+    cookie: {type: apiKey, in: cookie, name: lb_session}
+  parameters:
+    id: {name: id, in: path, required: true, schema: {type: string}}
+    ref: {name: ref, in: path, required: true, schema: {type: string}, description: Id, or key/ref such as WEB / WEB-42}
+    status: {name: status, in: query, schema: {type: array, items: {type: string}}, description: "todo, in_progress, blocked, done (repeat or comma-separate)"}
+    priority: {name: priority, in: query, schema: {type: array, items: {type: string}}, description: "high, medium, low"}
+    type: {name: type, in: query, schema: {type: array, items: {type: string}}, description: "improvement, feature, bug, or none for tasks without a type (repeat or comma-separate)"}
+    label: {name: label, in: query, schema: {type: array, items: {type: string}}, description: Label names}
+    q: {name: q, in: query, schema: {type: string}, description: Full-text search (prefix matching) or a task ref}
+    sort: {name: sort, in: query, schema: {type: string, default: -updated_at}, description: "updated_at, created_at, title, due_date, priority, status, project, position, sequence, type, relevance (needs q); prefix - for descending"}
+    cursor: {name: cursor, in: query, schema: {type: string}}
+    limit: {name: limit, in: query, schema: {type: integer, minimum: 1, maximum: 200, default: 50}}
+  responses:
+    Error:
+      description: Problem details
+      content:
+        application/problem+json:
+          schema: {$ref: "#/components/schemas/Problem"}
+  schemas:
+    Problem:
+      type: object
+      properties:
+        type: {type: string}
+        title: {type: string}
+        status: {type: integer}
+        code: {type: string, description: "Stable machine-readable code, e.g. validation_failed, not_found, forbidden, insufficient_scope, version_conflict, project_archived, unsupported_file_type, file_too_large, rate_limited"}
+        detail: {type: string}
+        errors:
+          type: array
+          items:
+            type: object
+            properties:
+              field: {type: string}
+              message: {type: string}
+        current: {description: "On version_conflict: the task as it is now"}
+    CreateTask:
+      type: object
+      required: [project, title]
+      additionalProperties: false
+      properties:
+        project: {type: string, description: Project key or id}
+        title: {type: string, maxLength: 500}
+        description: {type: string, description: Markdown}
+        status: {type: string, default: todo}
+        priority: {type: string, default: medium}
+        due_date: {type: [string, "null"], format: date}
+        labels: {type: array, items: {type: string}}
+        create_missing_labels: {type: boolean, default: true}
+        external_ref: {type: string, maxLength: 200}
+        position: {type: number}
+        sequence: {type: [integer, "null"], minimum: 0, maximum: 1000000, description: "Work order: 1 is tackled first, 2 next... Empty means not sequenced"}
+        type: {type: [string, "null"], enum: [improvement, feature, bug, null], description: "Optional kind of task. Valid values are listed by GET /meta"}
+    UpdateTask:
+      type: object
+      additionalProperties: false
+      properties:
+        title: {type: string}
+        description: {type: string, description: Markdown, replaces the whole description}
+        status: {type: string}
+        priority: {type: string}
+        due_date: {type: [string, "null"], format: date}
+        labels: {type: array, items: {type: string}, description: Replaces the full label set}
+        add_labels: {type: array, items: {type: string}}
+        remove_labels: {type: array, items: {type: string}}
+        create_missing_labels: {type: boolean, default: true}
+        external_ref: {type: [string, "null"]}
+        position: {type: number}
+        sequence: {type: [integer, "null"], minimum: 0, maximum: 1000000, description: "Work order (1 first); null clears it"}
+        type: {type: [string, "null"], description: "improvement, feature or bug; null clears it"}
+        project: {type: string, description: Move to this project}
+        version: {type: integer, description: Fail with 409 if the stored version differs}
+    Task:
+      type: object
+      properties:
+        id: {type: string, format: uuid}
+        ref: {type: string, example: WEB-42}
+        number: {type: integer}
+        project: {type: object, properties: {id: {type: string}, key: {type: string}, name: {type: string}, color: {type: string}}}
+        title: {type: string}
+        description: {type: string, description: Markdown; omitted from list responses by default}
+        status: {type: string}
+        priority: {type: string}
+        due_date: {type: [string, "null"], format: date}
+        labels: {type: array, items: {type: object, properties: {id: {type: string}, name: {type: string}, color: {type: string}}}}
+        external_ref: {type: [string, "null"]}
+        version: {type: integer}
+        position: {type: number}
+        sequence: {type: [integer, "null"], description: "Work order: 1 is tackled first; null when not sequenced"}
+        type: {type: [string, "null"], description: "improvement, feature, bug, or null when the task has no type"}
+        created_at: {type: string, format: date-time}
+        updated_at: {type: string, format: date-time}
